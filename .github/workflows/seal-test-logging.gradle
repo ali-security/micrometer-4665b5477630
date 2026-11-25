@@ -1,0 +1,28 @@
+// Init script for seal-build.yml: prints failures/skips as they happen and records every
+// test execution (one line per attempt, so upstream's develocity.testRetry attempts are
+// visible) to /tmp/seal-test-events/<task>.tsv for seal-test-report.py to aggregate.
+def eventsDir = new File('/tmp/seal-test-events')
+eventsDir.mkdirs()
+def lock = new Object()
+
+allprojects {
+    tasks.withType(Test).configureEach { t ->
+        testLogging {
+            events 'skipped', 'failed'
+            exceptionFormat 'full'
+        }
+        afterTest { desc, result ->
+            def fields = [t.path, desc.className ?: '', desc.name ?: '', desc.parent?.name ?: '',
+                          desc.displayName ?: '', result.resultType.toString()]
+            def line = fields.collect { it.toString().replace('\t', ' ').replace('\n', ' ') }.join('\t') + '\n'
+            synchronized (lock) {
+                new File(eventsDir, t.path.replace(':', '_') + '.tsv') << line
+            }
+        }
+        afterSuite { desc, result ->
+            if (!desc.parent) {
+                println "GRADLE RAW SUMMARY ${t.path} (counts every retry attempt): ${result.resultType} - ${result.testCount} executions, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped"
+            }
+        }
+    }
+}

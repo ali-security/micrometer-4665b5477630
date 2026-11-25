@@ -1,0 +1,127 @@
+name: seal-build
+
+# Upstream builds and tests on CircleCI only (.circleci/config.yml); its GitHub Actions
+# workflows neither build nor test. This workflow translates the CircleCI jobs:
+#   build        (cimg/openjdk:21.0.2: `./gradlew build` + shenandoahTest/zgcTest/zgcGenerationalTest)
+#   build-jdk11  (cimg/openjdk:11.0.22: `./gradlew build`)
+#   build-jdk17  (cimg/openjdk:17.0.11: `./gradlew build`)
+#   docker-tests (machine executor: `./gradlew dockerTest`)
+# scoped to micrometer-core (the released artifact) plus the modules whose sources the
+# sealed patches touch (micrometer-registry-statsd, micrometer-jetty12). Lint/format/
+# license/API-compat gates that `build` chains in via `check` are not run.
+# The project's own Develocity test retry (maxRetries 3) stays on, as on CircleCI;
+# --no-build-cache keeps Develocity's remote build cache from serving test results.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test selector (e.g. ":micrometer-core:test --tests *FooTest"); empty runs the full suite'
+        required: false
+        default: ''
+
+env:
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs="-Xmx2048m -XX:+HeapDumpOnOutOfMemoryError"'
+  GRADLE_FLAGS: >-
+    --no-daemon --console=plain --stacktrace --no-build-cache --continue
+    -I .github/workflows/seal-test-logging.gradle
+    -Porg.gradle.java.installations.fromEnv=JAVA_HOME_11_X64,JAVA_HOME_17_X64,JAVA_HOME_21_X64
+    -Prelease.version=1.13.4 -Prelease.stage=final -Prelease.disableGitChecks=true
+    -PcompatibleVersion=SKIP
+
+jobs:
+  build:
+    name: build (JDK ${{ matrix.jdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jdk: '21'
+            java-versions: |
+              11
+              21.0.2
+            extra-tasks: ':micrometer-core:shenandoahTest :micrometer-core:zgcTest :micrometer-core:zgcGenerationalTest'
+            package: true
+          - jdk: '17'
+            java-versions: |
+              11
+              17.0.11
+            extra-tasks: ''
+            package: false
+          - jdk: '11'
+            java-versions: |
+              11.0.22
+            extra-tasks: ''
+            package: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-versions }}
+          cache: gradle
+
+      - name: Test (and package on the JDK 21 leg)
+        run: |
+          java -version
+          PACKAGE_TASKS=""
+          if [ "${{ matrix.package }}" = "true" ]; then PACKAGE_TASKS=":micrometer-core:jar"; fi
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_FLAGS ${{ inputs.test-filter }} $PACKAGE_TASKS
+          else
+            ./gradlew $GRADLE_FLAGS \
+              :micrometer-core:test :micrometer-core:java11Test \
+              :micrometer-registry-statsd:test :micrometer-jetty12:test \
+              ${{ matrix.extra-tasks }} $PACKAGE_TASKS
+          fi
+
+      - name: Test results summary and skipped tests with reasons
+        if: always()
+        run: python3 .github/workflows/seal-test-report.py
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.package
+        with:
+          name: micrometer-core-jar
+          path: micrometer-core/build/libs/micrometer-core-1.13.4.jar
+          if-no-files-found: error
+
+  docker-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: |
+            11
+            21.0.2
+          cache: gradle
+
+      - name: Allow the Docker API version used by testcontainers 1.19.8
+        run: |
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+          printf '[Service]\nEnvironment=DOCKER_MIN_API_VERSION=1.24\n' | sudo tee /etc/systemd/system/docker.service.d/min-api.conf
+          sudo systemctl daemon-reload
+          sudo systemctl restart docker || { sudo journalctl -xeu docker.service --no-pager | tail -50; exit 1; }
+          docker version
+
+      - name: Docker tests
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew $GRADLE_FLAGS ${{ inputs.test-filter }}
+          else
+            ./gradlew $GRADLE_FLAGS :micrometer-core:dockerTest :micrometer-registry-statsd:dockerTest :micrometer-jetty12:dockerTest
+          fi
+
+      - name: Test results summary and skipped tests with reasons
+        if: always()
+        run: python3 .github/workflows/seal-test-report.py
